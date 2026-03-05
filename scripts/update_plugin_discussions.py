@@ -23,8 +23,55 @@ class UpdatePluginDiscussionsError(Exception):
     pass
 
 
+class GitHubHttpError(UpdatePluginDiscussionsError):
+    def __init__(
+        self,
+        *,
+        status: int,
+        method: str,
+        url: str,
+        request_id: str,
+        scopes: str,
+        body: str,
+    ) -> None:
+        super().__init__(f"HTTP {status} {method} {url}")
+        self.status = status
+        self.method = method
+        self.url = url
+        self.request_id = request_id
+        self.scopes = scopes
+        self.body = body
+
+
 def _fail(msg: str) -> NoReturn:
     raise UpdatePluginDiscussionsError(msg)
+
+
+def _is_transient_http_status(status: int) -> bool:
+    return status in {408, 429, 500, 502, 503, 504}
+
+
+def _with_retries(label: str, fn: Any, max_attempts: int = 3) -> Any:
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except GitHubHttpError as e:
+            last_err = e
+            if not _is_transient_http_status(e.status) or attempt == max_attempts:
+                raise
+            print(
+                f"WARN: transient HTTP error during {label} attempt {attempt}/{max_attempts}: "
+                f"status={e.status} request_id={e.request_id}"
+            )
+        except Exception as e:
+            last_err = e
+            if attempt == max_attempts:
+                raise
+            print(f"WARN: transient error during {label} attempt {attempt}/{max_attempts}: {e}")
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("unreachable")
 
 
 def _run(cmd: list[str]) -> str:
@@ -117,6 +164,7 @@ def _rest_request_json(method: str, url: str, body: dict[str, Any] | None = None
         headers={
             "Authorization": f"Bearer {_token()}",
             "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "a0-plugins-discussion-updater",
             "Content-Type": "application/json",
         },
@@ -137,9 +185,13 @@ def _rest_request_json(method: str, url: str, body: dict[str, Any] | None = None
         headers = {k.lower(): v for (k, v) in e.headers.items()} if e.headers else {}
         req_id = headers.get("x-github-request-id", "")
         scopes = headers.get("x-oauth-scopes", "")
-        _fail(
-            f"GitHub REST request failed status={e.code} method={method} url={url} "
-            f"request_id={req_id!s} scopes={scopes!s} body={raw[:800]}"
+        raise GitHubHttpError(
+            status=int(e.code),
+            method=method,
+            url=url,
+            request_id=req_id,
+            scopes=scopes,
+            body=raw,
         )
     except Exception as e:
         _fail(f"GitHub REST request failed method={method} url={url}: {e}")
@@ -186,7 +238,14 @@ def _graphql_request(query: str, variables: dict[str, Any]) -> dict[str, Any]:
         if e.headers:
             req_id = e.headers.get("x-github-request-id", "")
             scopes = e.headers.get("x-oauth-scopes", "")
-        _fail(f"GitHub GraphQL request failed status={e.code} request_id={req_id!s} scopes={scopes!s}: {msg}")
+        raise GitHubHttpError(
+            status=int(e.code),
+            method="POST",
+            url="https://api.github.com/graphql",
+            request_id=req_id,
+            scopes=scopes,
+            body=msg,
+        )
     except Exception as e:
         _fail(f"GitHub GraphQL request failed: {e}")
 
@@ -485,7 +544,26 @@ def _update_discussion_rest(owner: str, repo: str, discussion_url: str, title: s
         _fail(f"Unable to parse discussion number from url: {discussion_url}")
 
     api_url = f"https://api.github.com/repos/{owner}/{repo}/discussions/{number}"
-    _rest_request_json("PATCH", api_url, {"title": title, "body": body})
+
+    def _preflight() -> None:
+        _rest_request_json("GET", api_url)
+
+    def _do_patch() -> None:
+        _rest_request_json("PATCH", api_url, {"title": title, "body": body})
+
+    try:
+        _with_retries("discussion REST preflight", _preflight)
+    except GitHubHttpError as e:
+        if e.status == 404:
+            _fail(
+                "GitHub REST returned 404 for discussion resource. This is usually either: "
+                "(1) Discussions REST API not enabled/available, or (2) token lacks Discussions permission, "
+                "or (3) GitHub is masking a 403 as 404. "
+                f"url={api_url} request_id={e.request_id} body={e.body[:300]}"
+            )
+        raise
+
+    _with_retries("discussion REST patch", _do_patch)
 
 
 def main() -> int:
@@ -522,39 +600,64 @@ def main() -> int:
     created = 0
     updated = 0
     skipped = 0
+    failed: list[str] = []
 
     for plugin_name in plugin_names:
-        if not _plugin_exists(plugin_name):
-            print(f"Plugin deleted; skipping discussion: {plugin_name}")
-            continue
+        try:
+            if not _plugin_exists(plugin_name):
+                print(f"Plugin deleted; skipping discussion: {plugin_name}")
+                continue
 
-        meta = _read_plugin_yaml(plugin_name)
-        expected_title = _discussion_title(plugin_name)
+            meta = _read_plugin_yaml(plugin_name)
+            expected_title = _discussion_title(plugin_name)
 
-        existing = _find_existing_discussion(owner, repo, plugin_name, expected_title)
-        if existing:
-            disc_id = existing.get("id")
-            closed = existing.get("closed")
-            existing_url = existing.get("url") if isinstance(existing.get("url"), str) else ""
-            if isinstance(disc_id, str) and closed is True:
-                _reopen_discussion(disc_id)
+            def _find() -> dict[str, Any] | None:
+                return _find_existing_discussion(owner, repo, plugin_name, expected_title)
 
-            if existing_url:
-                body = _render_discussion_body(plugin_name, meta, owner, repo)
-                _update_discussion_rest(owner, repo, existing_url, expected_title, body)
-                updated += 1
-                print(f"Updated: {plugin_name} -> {existing.get('url')}")
-            else:
-                skipped += 1
-                print(f"Exists (no id): {plugin_name} -> {existing.get('url')}")
-            continue
+            existing = _with_retries(f"search discussion {plugin_name}", _find)
+            if existing:
+                disc_id = existing.get("id")
+                closed = existing.get("closed")
+                existing_url = existing.get("url") if isinstance(existing.get("url"), str) else ""
+                if isinstance(disc_id, str) and closed is True:
+                    _with_retries(f"reopen discussion {plugin_name}", lambda: _reopen_discussion(disc_id))
 
-        body = _render_discussion_body(plugin_name, meta, owner, repo)
-        disc = _create_discussion(repo_id, category_id, expected_title, body)
-        created += 1
-        print(f"Created: {plugin_name} -> {disc.get('url')}")
+                if existing_url:
+                    body = _render_discussion_body(plugin_name, meta, owner, repo)
+                    _with_retries(
+                        f"update discussion {plugin_name}",
+                        lambda: _update_discussion_rest(owner, repo, existing_url, expected_title, body),
+                    )
+                    updated += 1
+                    print(f"Updated: {plugin_name} -> {existing.get('url')}")
+                else:
+                    skipped += 1
+                    print(f"Exists (no url): {plugin_name} -> {existing.get('url')}")
+                continue
 
-    print(f"Done. created={created} updated={updated} skipped={skipped} total={len(plugin_names)}")
+            body = _render_discussion_body(plugin_name, meta, owner, repo)
+            disc = _with_retries(
+                f"create discussion {plugin_name}",
+                lambda: _create_discussion(repo_id, category_id, expected_title, body),
+            )
+            created += 1
+            print(f"Created: {plugin_name} -> {disc.get('url')}")
+        except UpdatePluginDiscussionsError as e:
+            failed.append(plugin_name)
+            print(f"ERROR: plugin={plugin_name}: {e}")
+        except Exception as e:
+            failed.append(plugin_name)
+            print(f"ERROR: plugin={plugin_name}: {e}")
+
+    print(
+        f"Done. created={created} updated={updated} skipped={skipped} "
+        f"failed={len(failed)} total={len(plugin_names)}"
+    )
+    if failed:
+        print("Failed plugins:")
+        for n in failed:
+            print(f"- {n}")
+        return 1
     return 0
 
 
