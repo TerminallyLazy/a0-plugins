@@ -50,5 +50,6 @@ jobs:
           BEFORE_SHA: ${{ github.sha }}
           AFTER_SHA: ${{ github.sha }}
           MAX_PLUGINS: ${{ github.event.inputs.max_plugins || '500' }}
+          RUN_ALL: "1"
         run: |
           python scripts/update_plugin_discussions.py
