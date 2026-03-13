@@ -4,7 +4,6 @@ import re
 import argparse
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -12,7 +11,7 @@ from typing import Any, NoReturn, cast
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = REPO_ROOT / "index.json"
 DEFAULT_CHUNK_SIZE = 50
-DEFAULT_UPDATES_PATH = REPO_ROOT / "stars_updates.json"
+DEFAULT_UPDATES_PATH = REPO_ROOT / "repo_stats_updates.json"
 
 
 class UpdateStarsError(Exception):
@@ -28,46 +27,6 @@ def _token() -> str:
     if not token:
         _fail("GITHUB_TOKEN is required")
     return token
-
-
-def _graphql(query: str) -> dict[str, Any]:
-    req = urllib.request.Request(
-        "https://api.github.com/graphql",
-        data=json.dumps({"query": query}).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {_token()}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "a0-plugins-stars-updater",
-            "Content-Type": "application/json",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            payload = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        msg = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-        _fail(f"GitHub GraphQL request failed ({e.code}): {msg}")
-    except Exception as e:
-        _fail(f"GitHub GraphQL request failed: {e}")
-
-    try:
-        parsed = json.loads(payload)
-    except Exception as e:
-        _fail(f"GitHub GraphQL returned invalid JSON: {e}: {payload[:500]}")
-
-    if not isinstance(parsed, dict):
-        _fail("GitHub GraphQL returned non-object JSON")
-
-    # Note: GitHub GraphQL can return partial data with per-field errors (e.g. NOT_FOUND
-    # for a single repository). We must not fail the whole run on those.
-
-    data = parsed.get("data")
-    if not isinstance(data, dict):
-        _fail("GitHub GraphQL response missing data")
-
-    return cast(dict[str, Any], data)
 
 
 def _extract_alias_errors(parsed: dict[str, Any]) -> dict[str, str]:
@@ -127,6 +86,30 @@ def _save_index(index: dict[str, Any]) -> None:
     INDEX_PATH.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _extract_plugin_version(plugin_yaml_text: str) -> str | None:
+    match = re.search(r"(?m)^version\s*:\s*(['\"]?)([^'\"#\n]+)\1\s*(?:#.*)?$", plugin_yaml_text)
+    if not match:
+        return None
+    version = match.group(2).strip()
+    return version or None
+
+
+def _extract_latest_commit(repo_obj: dict[str, Any]) -> tuple[str, str] | None:
+    default_branch_ref = repo_obj.get("defaultBranchRef")
+    if not isinstance(default_branch_ref, dict):
+        return None
+    target = default_branch_ref.get("target")
+    if not isinstance(target, dict):
+        return None
+    oid = target.get("oid")
+    committed_date = target.get("committedDate")
+    if not isinstance(oid, str) or not oid:
+        return None
+    if not isinstance(committed_date, str) or not committed_date:
+        return None
+    return oid, committed_date
+
+
 def _scan_and_write_updates(chunk_size: int, updates_path: Path) -> int:
     index = _load_index()
     plugins = cast(dict[str, Any], index.get("plugins"))
@@ -155,7 +138,7 @@ def _scan_and_write_updates(chunk_size: int, updates_path: Path) -> int:
         blocks: list[str] = []
         for i, (_, owner, repo) in enumerate(batch):
             blocks.append(
-                f'r{i}: repository(owner: "{owner}", name: "{repo}") {{ stargazerCount }}'
+                f'r{i}: repository(owner: "{owner}", name: "{repo}") {{ stargazerCount defaultBranchRef {{ target {{ ... on Commit {{ oid committedDate }} }} }} object(expression: "HEAD:plugin.yaml") {{ ... on Blob {{ text }} }} }}'
             )
         query = "query {\n" + "\n".join(blocks) + "\n}"
         # We want per-alias errors without failing the whole run.
@@ -214,9 +197,21 @@ def _scan_and_write_updates(chunk_size: int, updates_path: Path) -> int:
                 "stars": stars,
                 "repo": f"{owner}/{repo}",
             }
+            latest_commit = _extract_latest_commit(repo_obj)
+            if latest_commit is not None:
+                commit_sha, updated = latest_commit
+                updates[plugin_name]["commit"] = commit_sha
+                updates[plugin_name]["updated"] = updated
+            plugin_yaml_obj = repo_obj.get("object")
+            if isinstance(plugin_yaml_obj, dict):
+                plugin_yaml_text = plugin_yaml_obj.get("text")
+                if isinstance(plugin_yaml_text, str):
+                    version = _extract_plugin_version(plugin_yaml_text)
+                    if version is not None:
+                        updates[plugin_name]["version"] = version
 
     updates_path.write_text(json.dumps(updates, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"Wrote stars updates for {len(updates)} plugins -> {updates_path.relative_to(REPO_ROOT)}")
+    print(f"Wrote repo stats updates for {len(updates)} plugins -> {updates_path.relative_to(REPO_ROOT)}")
     return 0
 
 
@@ -243,10 +238,25 @@ def _apply_updates(updates_path: Path) -> int:
         stars = upd.get("stars")
         if isinstance(stars, int):
             entry["stars"] = stars
+        version = upd.get("version")
+        if isinstance(version, str) and version:
+            entry["version"] = version
+        commit = upd.get("commit")
+        if not isinstance(commit, str) or not commit:
+            commit = upd.get("latest_commit") if isinstance(upd.get("latest_commit"), str) else None
+        if isinstance(commit, str) and commit:
+            entry["commit"] = commit
+            entry.pop("latest_commit", None)
+        updated = upd.get("updated")
+        if not isinstance(updated, str) or not updated:
+            updated = upd.get("latest_commit_timestamp") if isinstance(upd.get("latest_commit_timestamp"), str) else None
+        if isinstance(updated, str) and updated:
+            entry["updated"] = updated
+            entry.pop("latest_commit_timestamp", None)
         applied += 1
 
     _save_index(index)
-    print(f"Applied stars updates to {applied} plugins")
+    print(f"Applied repo stats updates to {applied} plugins")
     return 0
 
 
