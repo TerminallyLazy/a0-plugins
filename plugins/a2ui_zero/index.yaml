@@ -1,5 +1,5 @@
 title: a2ui-zero
-description: Rich, interactive AI responses in Agent Zero chat and the canvas. Compose cards, images, comparisons, and forms at runtime; choices and submitted answers continue the conversation. Uses A2UI v0.9.1 with a native component catalog and Agent Zero design tokens.
+description: Rich, interactive AI responses directly in Agent Zero chat. Compose cards, images, audio, video, comparisons, and forms at runtime; choices and submitted answers continue the conversation. Uses A2UI v0.9.1 with a native component catalog and Agent Zero design tokens.
 github: https://github.com/3clyp50/a2ui-zero
 tags:
   - ui
@@ -8,3 +8,4 @@ tags:
   - integration
 screenshots:
   - https://raw.githubusercontent.com/3clyp50/a2ui-zero/main/docs/screenshots/comparison-layout.png
+  - https://raw.githubusercontent.com/3clyp50/a2ui-zero/main/docs/screenshots/media-cards.png
